@@ -1,43 +1,106 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue';
-import { db, auth } from './firebase.js'; // Imports your keys (Updated to include .js extension)
-import { collection, onSnapshot, doc, updateDoc } from 'firebase/firestore';
+import { ref, computed, onMounted, watch } from 'vue';
+import { db, auth } from './firebase.js'; // Imports your keys
+import { collection, onSnapshot, doc, updateDoc, addDoc, deleteDoc } from 'firebase/firestore';
 import { signInWithEmailAndPassword, signOut, onAuthStateChanged } from 'firebase/auth';
 
 // --- STATE ---
 const isLoggedIn = ref(false);
+const isAdminView = ref(false); // NEW: Tracks which screen is active (Public vs Admin)
 const showLoginModal = ref(false);
 const emailInput = ref("");
 const passwordInput = ref("");
 const loginError = ref("");
+const dataError = ref(null);
 const medals = ref([]);
+
+// Pagination State
+const currentPage = ref(1);
+const itemsPerPage = 10;
+
+// New State for "Add Country" form
+const newName = ref("");
+const newFlag = ref("");
+const newGold = ref(0);
+const newSilver = ref(0);
+const newBronze = ref(0);
+
+// Auto-fill Data
+const allCountries = ref([]);
 
 // --- 1. REAL-TIME DATA LISTENER ---
 onMounted(() => {
-  // Listen for Auth Changes (Is admin logged in?)
+  // Listen for Auth Changes
   onAuthStateChanged(auth, (user) => {
     isLoggedIn.value = !!user;
+    // If user logs in, automatically show the Admin View
+    if (user) {
+      isAdminView.value = true;
+    } else {
+      isAdminView.value = false;
+    }
   });
 
-  // Listen for Database Changes (Real-time updates)
+  // Listen for Database Changes
   const countriesCollection = collection(db, "countries");
   onSnapshot(countriesCollection, (snapshot) => {
     medals.value = snapshot.docs.map(doc => ({
       id: doc.id,
       ...doc.data()
     }));
+    dataError.value = null;
+  }, (error) => {
+    console.error("Firebase Error:", error);
+    if (error.code === 'permission-denied') {
+      dataError.value = "Access Denied: Please update Firestore Rules in Firebase Console to 'allow read: if true;'";
+    } else {
+      dataError.value = "Database Error: " + error.message;
+    }
   });
+
+  // Fetch Country List for Auto-complete
+  fetch("https://restcountries.com/v3.1/all?fields=name,flag")
+    .then(res => res.json())
+    .then(data => {
+      // Sort alphabetically
+      allCountries.value = data.sort((a, b) => 
+        a.name.common.localeCompare(b.name.common)
+      );
+    })
+    .catch(err => console.log("Auto-complete API unavailable"));
 });
 
-// --- 2. SORTING LOGIC ---
+// --- 2. SORTING & PAGINATION LOGIC ---
 const sortedMedals = computed(() => {
   return [...medals.value].sort((a, b) => {
-    // Sort logic: Gold -> Silver -> Bronze
     if (b.gold !== a.gold) return b.gold - a.gold;
     if (b.silver !== a.silver) return b.silver - a.silver;
     return b.bronze - a.bronze;
   });
 });
+
+const totalPages = computed(() => Math.ceil(sortedMedals.value.length / itemsPerPage));
+
+const paginatedMedals = computed(() => {
+  const start = (currentPage.value - 1) * itemsPerPage;
+  const end = start + itemsPerPage;
+  return sortedMedals.value.slice(start, end);
+});
+
+// Reset page if we delete enough items to make the current page invalid
+watch(totalPages, (newVal) => {
+  if (currentPage.value > newVal && newVal > 0) {
+    currentPage.value = newVal;
+  }
+});
+
+const nextPage = () => {
+  if (currentPage.value < totalPages.value) currentPage.value++;
+};
+
+const prevPage = () => {
+  if (currentPage.value > 1) currentPage.value--;
+};
 
 // --- 3. ACTIONS ---
 const login = async () => {
@@ -54,15 +117,68 @@ const login = async () => {
 
 const logout = async () => {
   await signOut(auth);
+  isAdminView.value = false; // Go back to public view on logout
 };
 
-// Update function (Only works if user is logged in)
-const updateCount = async (id, field, value) => {
+// Generic Update Function (Handles both Numbers and Strings)
+const updateCountry = async (id, field, value) => {
   if (!isLoggedIn.value) return;
   const countryRef = doc(db, "countries", id);
+  
+  // If editing medals, convert to Number. If editing Name/Flag, keep as String.
+  let finalValue = value;
+  if (['gold', 'silver', 'bronze'].includes(field)) {
+    finalValue = Number(value);
+  }
+
   await updateDoc(countryRef, {
-    [field]: Number(value) // Ensure it saves as a number
+    [field]: finalValue
   });
+};
+
+const deleteCountry = async (id, name) => {
+  if (!isLoggedIn.value) return;
+  if (confirm(`Are you sure you want to delete ${name}?`)) {
+    await deleteDoc(doc(db, "countries", id));
+  }
+};
+
+// Auto-fill flag when country name matches
+const onNameInput = () => {
+  const match = allCountries.value.find(c => c.name.common === newName.value);
+  if (match) {
+    newFlag.value = match.flag;
+  } else {
+    newFlag.value = ""; // Clear if no match found
+  }
+};
+
+const addCountry = async () => {
+  if (!isLoggedIn.value) return;
+  if (!newName.value || !newFlag.value) {
+    alert("Please select a valid Country Name from the list.");
+    return;
+  }
+
+  try {
+    await addDoc(collection(db, "countries"), {
+      name: newName.value,
+      flag: newFlag.value,
+      gold: Number(newGold.value),
+      silver: Number(newSilver.value),
+      bronze: Number(newBronze.value)
+    });
+
+    // Reset Form
+    newName.value = "";
+    newFlag.value = "";
+    newGold.value = 0;
+    newSilver.value = 0;
+    newBronze.value = 0;
+  } catch (e) {
+    console.error("Error adding document: ", e);
+    alert("Error adding country: " + e.message);
+  }
 };
 </script>
 
@@ -72,8 +188,8 @@ const updateCount = async (id, field, value) => {
     <!-- HEADER -->
     <header>
       <div class="brand-area">
-        <!-- Replaced "B" with image placeholder logic if you added logo.png, otherwise uses text -->
-        <div class="crest-placeholder">B</div>
+        <!-- REPLACED: Image Logo instead of Text Placeholder -->
+        <img src="/bcs_logo.png" alt="BCS Logo" class="crest-logo" />
         <div class="titles">
           <h1>Olympic Tracker</h1>
           <span class="subtitle">Brentwood College School</span>
@@ -92,6 +208,10 @@ const updateCount = async (id, field, value) => {
         
         <div v-else class="user-info">
           <span class="user-name">Athletics Dept</span>
+          <!-- NEW: Link to switch back to Admin Mode if viewing public board -->
+          <span v-if="!isAdminView" class="edit-link" @click="isAdminView = true">
+            <i class="fas fa-pen"></i> Edit Mode
+          </span>
           <span class="logout-link" @click="logout">Logout</span>
         </div>
       </div>
@@ -99,7 +219,8 @@ const updateCount = async (id, field, value) => {
 
     <main>
       <!-- PUBLIC VIEW (Read Only) -->
-      <div v-if="!isLoggedIn" class="card">
+      <!-- Show this if NOT in Admin View mode -->
+      <div v-if="!isAdminView" class="card">
         <table>
           <thead>
             <tr>
@@ -112,11 +233,18 @@ const updateCount = async (id, field, value) => {
             </tr>
           </thead>
           <tbody>
-            <tr v-if="medals.length === 0">
+            <tr v-if="dataError">
+              <td colspan="6" class="error-msg" style="padding: 2rem; text-align: center;">
+                <i class="fas fa-exclamation-triangle"></i> {{ dataError }}
+              </td>
+            </tr>
+            <tr v-else-if="medals.length === 0">
               <td colspan="6" style="padding: 2rem;">Loading data... (Or add countries in Firebase Console)</td>
             </tr>
-            <tr v-for="(country, index) in sortedMedals" :key="country.id" :class="{'top-3': index < 3}">
-              <td class="rank-cell">{{ index + 1 }}</td>
+            <!-- Use paginatedMedals here -->
+            <tr v-for="(country, index) in paginatedMedals" :key="country.id" :class="{'top-3': (currentPage === 1 && index < 3)}">
+              <!-- Calculate Rank based on page number -->
+              <td class="rank-cell">{{ (currentPage - 1) * itemsPerPage + index + 1 }}</td>
               <td class="country-cell">
                 <span class="flag">{{ country.flag }}</span> {{ country.name }}
               </td>
@@ -127,29 +255,96 @@ const updateCount = async (id, field, value) => {
             </tr>
           </tbody>
         </table>
+        
+        <!-- PAGINATION CONTROLS -->
+        <div v-if="totalPages > 1" class="pagination-footer">
+          <button 
+            @click="prevPage" 
+            :disabled="currentPage === 1" 
+            class="btn-page"
+          >
+            <i class="fas fa-chevron-left"></i> Prev
+          </button>
+          <span class="page-info">Page {{ currentPage }} of {{ totalPages }}</span>
+          <button 
+            @click="nextPage" 
+            :disabled="currentPage === totalPages" 
+            class="btn-page"
+          >
+            Next <i class="fas fa-chevron-right"></i>
+          </button>
+        </div>
       </div>
 
       <!-- ADMIN VIEW (Editable) -->
+      <!-- Show this ONLY if logged in AND in Admin View mode -->
       <div v-else class="admin-panel">
         <div class="admin-header">
           <h2><i class="fas fa-pen-to-square"></i> Update Medals</h2>
-          <button class="btn-secondary" @click="isLoggedIn = false">View Board</button>
+          <!-- UPDATED: Just switch view, don't logout -->
+          <button class="btn-secondary" @click="isAdminView = false">View Board</button>
         </div>
+
+        <!-- NEW: ADD COUNTRY FORM -->
+        <div class="add-country-form">
+          <h3>Add New Country</h3>
+          <div class="add-inputs">
+            <!-- Flag Display (Replaces text input) -->
+            <div class="flag-preview" title="Flag auto-fills based on name">
+              {{ newFlag || '🏳️' }}
+            </div>
+            
+            <!-- Smart Country Search -->
+            <input 
+              v-model="newName" 
+              list="country-options" 
+              @input="onNameInput"
+              placeholder="Search Country Name..." 
+              class="input-name"
+            >
+            <datalist id="country-options">
+              <option v-for="c in allCountries" :key="c.name.common" :value="c.name.common" />
+            </datalist>
+
+            <input type="number" v-model="newGold" placeholder="G" class="input-medal gold-border" min="0">
+            <input type="number" v-model="newSilver" placeholder="S" class="input-medal silver-border" min="0">
+            <input type="number" v-model="newBronze" placeholder="B" class="input-medal bronze-border" min="0">
+            <button @click="addCountry" class="btn-add"><i class="fas fa-plus"></i> Add</button>
+          </div>
+        </div>
+
         <div class="admin-grid">
           <div v-for="country in medals" :key="country.id" class="country-card">
-            <h3><span class="flag">{{ country.flag }}</span> {{ country.name }}</h3>
+            
+            <!-- EDITABLE HEADER (Flag, Name, Delete) -->
+            <div class="card-header-edit">
+              <input 
+                class="edit-flag" 
+                :value="country.flag" 
+                @change="e => updateCountry(country.id, 'flag', e.target.value)"
+              >
+              <input 
+                class="edit-name" 
+                :value="country.name" 
+                @change="e => updateCountry(country.id, 'name', e.target.value)"
+              >
+              <button class="btn-delete" @click="deleteCountry(country.id, country.name)" title="Delete Country">
+                <i class="fas fa-trash"></i>
+              </button>
+            </div>
+
             <div class="input-group">
               <div class="input-wrapper">
                 <label class="lbl-gold">Gold</label>
-                <input type="number" :value="country.gold" @change="e => updateCount(country.id, 'gold', e.target.value)" min="0">
+                <input type="number" :value="country.gold" @change="e => updateCountry(country.id, 'gold', e.target.value)" min="0">
               </div>
               <div class="input-wrapper">
                 <label>Silver</label>
-                <input type="number" :value="country.silver" @change="e => updateCount(country.id, 'silver', e.target.value)" min="0">
+                <input type="number" :value="country.silver" @change="e => updateCountry(country.id, 'silver', e.target.value)" min="0">
               </div>
               <div class="input-wrapper">
                 <label class="lbl-bronze">Bronze</label>
-                <input type="number" :value="country.bronze" @change="e => updateCount(country.id, 'bronze', e.target.value)" min="0">
+                <input type="number" :value="country.bronze" @change="e => updateCountry(country.id, 'bronze', e.target.value)" min="0">
               </div>
             </div>
           </div>
@@ -203,11 +398,15 @@ header {
 }
 
 .brand-area { display: flex; align-items: center; gap: 1rem; }
-.crest-placeholder {
-  width: 45px; height: 45px; background: white; border-radius: 50%;
-  display: grid; place-items: center; border: 2px solid white;
-  font-family: 'Georgia', serif; font-weight: 900; font-size: 1.4rem; color: var(--bcs-primary);
+
+/* REPLACED: New Logo Styles */
+.crest-logo {
+  width: 55px;
+  height: 55px;
+  object-fit: contain;
+  filter: drop-shadow(0 2px 4px rgba(0,0,0,0.2));
 }
+
 .titles h1 { margin: 0; font-size: 1.4rem; text-transform: uppercase; font-weight: 800; }
 .titles .subtitle { font-size: 0.7rem; opacity: 0.9; text-transform: uppercase; display: block; }
 
@@ -230,10 +429,14 @@ header {
 }
 .btn-header:hover { background: white; color: var(--bcs-primary); }
 
-.user-info { text-align: right; font-size: 0.75rem; line-height: 1.2; }
-.user-name { font-weight: bold; display: block; }
+.user-info { text-align: right; font-size: 0.75rem; line-height: 1.2; display: flex; align-items: center; gap: 15px; }
+.user-name { font-weight: bold; }
+
 .logout-link { color: rgba(255,255,255,0.8); cursor: pointer; text-decoration: underline; }
 .logout-link:hover { color: white; }
+
+.edit-link { color: white; cursor: pointer; text-decoration: none; font-weight: bold; background: rgba(0,0,0,0.2); padding: 5px 10px; border-radius: 4px; }
+.edit-link:hover { background: rgba(0,0,0,0.4); }
 
 /* LAYOUT */
 main { padding: 2rem; max-width: 1200px; margin: 0 auto; width: 100%; box-sizing: border-box; }
@@ -255,12 +458,89 @@ td { padding: 1.2rem 1rem; text-align: center; font-size: 1.3rem; font-weight: 5
 .gold-val { color: var(--gold); font-weight: 800; background: rgba(214, 175, 54, 0.08); border-radius: 6px; }
 .total-val { font-weight: 900; font-size: 1.4rem; }
 
+/* PAGINATION FOOTER */
+.pagination-footer {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 1rem;
+  background: var(--bg-color);
+  border-top: 1px solid #eee;
+  gap: 20px;
+}
+.page-info { font-weight: bold; color: var(--text-secondary); font-size: 0.9rem; }
+.btn-page {
+  background: white; border: 1px solid #ddd; padding: 8px 15px; border-radius: 4px; cursor: pointer; color: var(--text-primary); font-weight: 500;
+  display: flex; align-items: center; gap: 5px;
+}
+.btn-page:hover:not(:disabled) { background: #f0f0f0; border-color: #bbb; }
+.btn-page:disabled { opacity: 0.5; cursor: not-allowed; }
+
 /* ADMIN PANEL */
 .admin-panel { background: var(--card-bg); padding: 2rem; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.05); border: 1px solid #e5e7eb; }
 .admin-header { display: flex; justify-content: space-between; margin-bottom: 20px; padding-bottom: 15px; border-bottom: 2px solid #f3f4f6; }
+
+/* ADD COUNTRY FORM */
+.add-country-form {
+  background: #fdfdfd;
+  border: 1px dashed #ccc;
+  padding: 1.5rem;
+  border-radius: 8px;
+  margin-bottom: 2rem;
+}
+.add-country-form h3 { margin-top: 0; color: var(--text-secondary); font-size: 1rem; margin-bottom: 1rem; }
+.add-inputs {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center; /* Vertically align items */
+}
+.flag-preview {
+  width: 50px;
+  height: 40px; /* Match height of inputs */
+  font-size: 1.8rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f0f0f0;
+  border-radius: 4px;
+  cursor: default;
+  border: 1px solid #d1d5db; /* Match input border */
+}
+.input-name { flex: 2; min-width: 150px; font-weight: bold; }
+.input-medal { width: 60px; text-align: center; }
+.gold-border { border-color: var(--gold); }
+.silver-border { border-color: #aaa; }
+.bronze-border { border-color: var(--bronze); }
+.btn-add {
+  background: var(--bcs-primary); color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold;
+}
+.btn-add:hover { background: var(--bcs-primary-hover); }
+
+/* ADMIN GRID */
 .admin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 20px; }
 .country-card { border: 1px solid #e5e7eb; border-radius: 8px; padding: 15px; background: var(--bg-color); }
-.country-card h3 { margin: 0 0 15px 0; font-size: 1.1rem; display: flex; align-items: center; gap: 10px; }
+
+/* CARD HEADER EDIT */
+.card-header-edit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 15px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #eee;
+}
+.edit-flag { width: 40px; font-size: 1.5rem; border: 1px solid transparent; background: transparent; text-align: center; border-radius: 4px; }
+.edit-flag:hover, .edit-flag:focus { border-color: #ddd; background: white; }
+
+.edit-name { flex: 1; font-weight: bold; font-size: 1.1rem; border: 1px solid transparent; background: transparent; color: var(--text-primary); padding: 4px; border-radius: 4px;}
+.edit-name:hover, .edit-name:focus { border-color: #ddd; background: white; }
+
+.btn-delete {
+  background: none; border: none; color: #ccc; cursor: pointer; padding: 5px; transition: color 0.2s;
+}
+.btn-delete:hover { color: var(--bcs-primary); }
+
 .input-group { display: flex; gap: 10px; }
 .input-wrapper { flex: 1; text-align: center; }
 .input-wrapper label { display: block; font-size: 0.7rem; font-weight: bold; margin-bottom: 5px; text-transform: uppercase; color: #666; }
